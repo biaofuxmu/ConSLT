@@ -1,0 +1,1 @@
+python -m signjoey train configs/sign.yaml
