@@ -238,7 +238,6 @@ class SignModel(nn.Module):
             word_outputs2, hidden_output2, _, _ = decoder_outputs2
 
             vocab_weights = self.decoder.output_layer.weight # (vocab_size, d_model)
-            vocab_size = vocab_weights.shape[0]
 
 
             txt_log_probs = F.log_softmax(word_outputs, dim=-1) 
@@ -247,7 +246,8 @@ class SignModel(nn.Module):
             txt_log_probs_ = (txt_log_probs + txt_log_probs2) / 2
             preds = torch.argmax(txt_log_probs_, dim=-1) # (batch_size, seq_len)
 
-            negative_weights = self.negative_construction(preds, vocab_size, self.neg_num, vocab_weights, word_outputs.device)
+            # (batch_size * seq_len, neg_num ,d_model)
+            negative_weights = self.negative_construction(preds, self.neg_num, vocab_weights)
             neg_w_shape = negative_weights.shape
 
             hidden_output_flatten = hidden_output.view(-1, hidden_output.size(2))     
@@ -256,7 +256,7 @@ class SignModel(nn.Module):
             output_unseq = hidden_output_flatten.unsqueeze(1)  
             output_expand = output_unseq.expand(neg_w_shape[0], neg_w_shape[1], neg_w_shape[2]) 
 
-            token_cl_loss = self.compute_token_infonce_loss(hidden_output_flatten, hidden_output_flatten2, output_expand, negative_weights)
+            token_cl_loss = self.compute_token_infonce_loss(hidden_output_flatten, hidden_output_flatten2, output_expand, negative_weights, batch.txt_mask.view(-1))
 
 
             nmt_loss = (
@@ -274,22 +274,22 @@ class SignModel(nn.Module):
 
         return recognition_loss, translation_loss
 
-    def negative_construction(self, preds, vocab_size, neg_num, liner_weight, device):
-        negative_lists = []
-        for pred in preds:
-            pred_vocab = set(pred.cpu().numpy().tolist())
-            for i in range(pred.shape[0]):
-                sents_over = list(set(range(vocab_size)) - pred_vocab)
+    def negative_construction(self, preds, neg_num, vocab_weights):
+        vocab_size, D = vocab_weights.shape
+        B, T = preds.shape
 
-                index = torch.LongTensor(random.sample(sents_over, neg_num)).to(device)
-                samples = torch.index_select(liner_weight, 0, index)
-                negative_lists.append(samples)
+        # convert preds to a boolean mask of shape (B, vocab_size)
+        pred_mask = torch.zeros(B, vocab_size, dtype=torch.bool, device=preds.device)
+        pred_mask.scatter_(1, preds, 1)
 
-        negative_weights = torch.stack(negative_lists, dim=0)
+        # select negative samples by masking the vocab_weights tensor
+        neg_mask = ~pred_mask.unsqueeze(1).expand(B, T, vocab_size).reshape(-1, vocab_size)
+        index = torch.multinomial(neg_mask.float(), neg_num, replacement=False)
+        negative_weights = vocab_weights[index]
 
         return negative_weights
 
-    def compute_token_infonce_loss(self, p, q, p_pos=None, q_neg=None, pad_mask=None):
+    def compute_token_infonce_loss(self, p, q, p_pos, q_neg, pad_mask=None):
 
         p_loss = F.kl_div(F.log_softmax(p, dim=-1), F.softmax(q, dim=-1), reduction='none').mean(dim=-1)
         q_loss = F.kl_div(F.log_softmax(q, dim=-1), F.softmax(p, dim=-1), reduction='none').mean(dim=-1)
@@ -307,9 +307,11 @@ class SignModel(nn.Module):
 
         loss = -loss
 
-        loss = -torch.nn.LogSoftmax(-1)(torch.div(loss, 0.1))[:, 0].sum()   
+        loss = -torch.nn.LogSoftmax(-1)(torch.div(loss, 0.1))[:, 0]
+        if pad_mask is not None:
+            loss.masked_fill_(pad_mask, 0.0)
 
-        return loss
+        return loss.sum()
 
     def run_batch(
         self,
